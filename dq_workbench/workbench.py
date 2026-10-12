@@ -14,6 +14,14 @@ import json
 import sqlite3
 from pathlib import Path
 
+from dq_workbench.hitl import (
+    Adjudication,
+    AdjudicationAction,
+    PredictionVisibility,
+    ReviewConfidence,
+    ReviewerRole,
+    arbitrate_review_conflict,
+)
 from dq_workbench.models import (
     AuditEvent,
     Finding,
@@ -32,6 +40,10 @@ CREATE TABLE IF NOT EXISTS issues (
 );
 CREATE TABLE IF NOT EXISTS audit_events (
   event_id TEXT PRIMARY KEY, at TEXT, doc JSON NOT NULL
+);
+CREATE TABLE IF NOT EXISTS adjudications (
+  adjudication_id TEXT PRIMARY KEY, issue_id TEXT, is_revoked INTEGER,
+  doc JSON NOT NULL
 );
 """
 
@@ -147,6 +159,70 @@ class Workbench:
             out.append(AuditEvent(event_id=d["event_id"], event_type=d["event_type"],
                                   payload=d.get("payload", {}), actor=d.get("actor", ""),
                                   at=d["at"], prev_event_id=d.get("prev_event_id", "")))
+        return out
+
+    # ---- HITL 仲裁（SSI V2-3/H3 语义）----
+    def adjudicate(
+        self,
+        issue_id: str,
+        reviewer: str,
+        role: ReviewerRole,
+        action: AdjudicationAction,
+        confidence: ReviewConfidence,
+        note: str = "",
+        visibility: PredictionVisibility = PredictionVisibility.PREDICTION_HIDDEN,
+    ) -> AdjudicationAction:
+        """追加一条人工裁决并即时仲裁。返回路由动作（迁移由调用方执行，
+        关闭仍须人工走 transition——W2 不被仲裁绕过）。"""
+        if self._get_issue(issue_id) is None:
+            raise KeyError(issue_id)
+        adj = Adjudication(
+            adjudication_id=new_id("adj"), issue_id=issue_id, reviewer=reviewer,
+            role=role, action=action, confidence=confidence,
+            visibility=visibility, note=note)
+        self.db.execute("INSERT INTO adjudications VALUES (?,?,?,?)",
+                        (adj.adjudication_id, issue_id, 0,
+                         json.dumps(adj.__dict__, ensure_ascii=False, default=str)))
+        self.db.commit()
+        self._audit("ISSUE_ADJUDICATED",
+                    {"issue_id": issue_id, "reviewer": reviewer, "role": role.value,
+                     "action": action.value, "adjudication_id": adj.adjudication_id})
+        routing = self.arbitration(issue_id)
+        self._audit("ARBITRATION_ROUTED", {"issue_id": issue_id, "routing": routing.value},
+                    actor=reviewer)
+        return routing
+
+    def revoke_adjudication(self, adjudication_id: str, actor: str) -> AdjudicationAction:
+        """撤销只标记（不删除），重仲裁。"""
+        row = self.db.execute(
+            "SELECT issue_id FROM adjudications WHERE adjudication_id=?",
+            (adjudication_id,)).fetchone()
+        if row is None:
+            raise KeyError(adjudication_id)
+        self.db.execute("UPDATE adjudications SET is_revoked=1 WHERE adjudication_id=?",
+                        (adjudication_id,))
+        self.db.commit()
+        self._audit("ADJUDICATION_REVOKED",
+                    {"adjudication_id": adjudication_id, "issue_id": row[0]}, actor=actor)
+        return self.arbitration(row[0])
+
+    def arbitration(self, issue_id: str) -> AdjudicationAction:
+        return arbitrate_review_conflict(self.adjudications_for(issue_id))
+
+    def adjudications_for(self, issue_id: str) -> list[Adjudication]:
+        rows = self.db.execute(
+            "SELECT doc, is_revoked FROM adjudications WHERE issue_id=? ORDER BY rowid",
+            (issue_id,)).fetchall()
+        out = []
+        for doc, revoked in rows:
+            d = json.loads(doc)
+            out.append(Adjudication(
+                adjudication_id=d["adjudication_id"], issue_id=d["issue_id"],
+                reviewer=d["reviewer"], role=ReviewerRole(d["role"]),
+                action=AdjudicationAction(d["action"]),
+                confidence=ReviewConfidence(d["confidence"]),
+                visibility=PredictionVisibility(d["visibility"]),
+                note=d.get("note", ""), is_revoked=bool(revoked)))
         return out
 
     # ---- 内部 ----

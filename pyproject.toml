@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dq-workbench"
-version = "0.1.0"
+version = "0.1.1"
 description = "Unified DQ anomaly workbench: three-layer check orchestration, issue tickets with human-close-only state machine, append-only audit chain. Rejected findings never touch master data."
 readme = "README.md"
 requires-python = ">=3.9"

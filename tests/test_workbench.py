@@ -114,3 +114,84 @@ def test_findings_never_touch_master_data(wb):
     assert not any(k in public for k in ("outlet", "master", "identity_write", "save_outlet"))
     ids = wb.ingest([_finding(8)])
     assert wb.finding(ids[0]).source_run is not None  # 只在 workbench 自己库里
+
+
+# ---- HITL 双人仲裁（SSI V2-3/H3 移植）----
+
+from dq_workbench.hitl import (
+    AdjudicationAction,
+    ReviewConfidence,
+    ReviewerRole,
+    arbitrate_review_conflict,
+)
+
+
+def _issue(wb):
+    ids = wb.ingest([_finding(20)])
+    return wb.open_issue(ids, title="待仲裁")
+
+
+def test_support_refute_conflict_escalates_regardless_of_authority(wb):
+    iss = _issue(wb)
+    wb.adjudicate(iss.issue_id, "r1", ReviewerRole.REVIEWER,
+                  AdjudicationAction.SUPPORT, ReviewConfidence.HIGH)
+    r = wb.adjudicate(iss.issue_id, "r2", ReviewerRole.POLICY_OWNER,
+                      AdjudicationAction.REFUTE, ReviewConfidence.HIGH)
+    assert r is AdjudicationAction.ESCALATE  # 权威不压冲突
+
+
+def test_no_majority_vote(wb):
+    """2 SUPPORT vs 1 REFUTE 仍 ESCALATE——不用多数表决制造共识。"""
+    iss = _issue(wb)
+    for name in ("a", "b"):
+        wb.adjudicate(iss.issue_id, name, ReviewerRole.DATA_STEWARD,
+                      AdjudicationAction.SUPPORT, ReviewConfidence.HIGH)
+    r = wb.adjudicate(iss.issue_id, "c", ReviewerRole.REVIEWER,
+                      AdjudicationAction.REFUTE, ReviewConfidence.LOW)
+    assert r is AdjudicationAction.ESCALATE
+    # 反证保留：低权威的 REFUTE 记录仍在
+    refute_kept = [a for a in wb.adjudications_for(iss.issue_id)
+                   if a.action is AdjudicationAction.REFUTE and not a.is_revoked]
+    assert len(refute_kept) == 1
+
+
+def test_unanimous_support_resolves_routing(wb):
+    iss = _issue(wb)
+    wb.adjudicate(iss.issue_id, "r1", ReviewerRole.REVIEWER,
+                  AdjudicationAction.SUPPORT, ReviewConfidence.MEDIUM)
+    r = wb.adjudicate(iss.issue_id, "r2", ReviewerRole.DOMAIN_EXPERT,
+                      AdjudicationAction.SUPPORT, ReviewConfidence.HIGH)
+    assert r is AdjudicationAction.SUPPORT
+    # SUPPORT 路由后走正常人工迁移；仲裁不代替关闭（W2）
+    wb.transition(iss.issue_id, IssueStatus.ASSIGNED, actor="r1")
+    wb.transition(iss.issue_id, IssueStatus.IN_REVIEW)
+    wb.transition(iss.issue_id, IssueStatus.RESOLVED, note="双 SUPPORT")
+    with pytest.raises(PermissionError):
+        wb.transition(iss.issue_id, IssueStatus.CLOSED, actor="")  # 仍须人工关闭
+
+
+def test_revoke_marks_not_deletes_and_rerarbitrates(wb):
+    iss = _issue(wb)
+    wb.adjudicate(iss.issue_id, "r1", ReviewerRole.REVIEWER,
+                  AdjudicationAction.SUPPORT, ReviewConfidence.HIGH)
+    r_ref = wb.adjudicate(iss.issue_id, "r2", ReviewerRole.REVIEWER,
+                          AdjudicationAction.REFUTE, ReviewConfidence.HIGH)
+    assert r_ref is AdjudicationAction.ESCALATE
+    adj_r = [a for a in wb.adjudications_for(iss.issue_id)
+             if a.action is AdjudicationAction.REFUTE][0]
+    after = wb.revoke_adjudication(adj_r.adjudication_id, actor="r2")
+    assert after is AdjudicationAction.SUPPORT
+    assert len(wb.adjudications_for(iss.issue_id)) == 2  # 记录仍在，只标 revoked
+
+
+def test_approve_repair_absent_from_action_enum():
+    # 修复批准是独立治理命题：裁决动作枚举里没有 APPROVE_REPAIR
+    assert not any("REPAIR" in a.value for a in AdjudicationAction)
+
+
+def test_adjudication_events_in_audit_chain(wb):
+    iss = _issue(wb)
+    wb.adjudicate(iss.issue_id, "r1", ReviewerRole.REVIEWER,
+                  AdjudicationAction.SUPPORT, ReviewConfidence.HIGH)
+    types = [e.event_type for e in wb.audit_chain()]
+    assert "ISSUE_ADJUDICATED" in types and "ARBITRATION_ROUTED" in types
