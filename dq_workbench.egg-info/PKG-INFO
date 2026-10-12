@@ -1,0 +1,46 @@
+Metadata-Version: 2.4
+Name: dq-workbench
+Version: 0.1.0
+Summary: Unified DQ anomaly workbench: three-layer check orchestration, issue tickets with human-close-only state machine, append-only audit chain. Rejected findings never touch master data.
+Author: TopPrism WP08
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Dynamic: license-file
+
+# dq-workbench
+
+统一 DQ 异常工作台（潜店雷达模块① WP08）。
+
+## 三层体检编排
+
+`spatial → identity → statistics` 顺序执行（`CheckAdapter` 接入面）；
+某层失败即 run 失败（fail-closed，不静默跳过）；`run_id` 贯穿全部发现。
+WP09 与 geocode-arbiter / identity-service / mousheng anomalies 真集成；
+本包提供 JSONL 回放 adapter 做管道验证。
+
+## 工单状态机
+
+```
+OPEN → ASSIGNED → IN_REVIEW → RESOLVED → CLOSED
+                ↘ REOPENED → ASSIGNED → …      非法迁移拒绝
+```
+
+- **只能人工关闭**：`transition(…, CLOSED, actor=…)` 缺 actor 即拒绝（W2）
+- SLA 到期清单 `overdue()`
+- 关联发现必须已入库（引用完整性）
+
+## 审计
+
+追加式 `AuditEvent` 链（`prev_event_id` 连续）；FINDINGS_INGESTED /
+ISSUE_CREATED / ISSUE_ASSIGNED / … / ISSUE_CLOSED 全留痕。
+
+## 验收不变量（测试锁定）
+
+- **W1 拒绝事件永不落主数据**：本包无任何主数据写路径（结构性测试）
+- **W2 工单只能人工关闭**
+- **W3 一切写操作产生审计事件且链连续**
+- **W4 状态机非法迁移拒绝**
